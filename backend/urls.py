@@ -15,10 +15,14 @@ Including another URLconf
     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
 """
 from django.contrib import admin
-from django.urls import path
+from django.urls import path, include
+
 from .views import upload_to_supabase
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('upload/', upload_to_supabase, name="upload_to_supabase")
+    path('run/', include('run.urls')),
+    
+    # supabase bucket 이미지 업로드 테스트용 url
+    path('upload/', upload_to_supabase, name="upload_to_supabase"),
 ]
