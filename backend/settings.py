@@ -31,7 +31,9 @@ ALLOWED_HOSTS = []
 # Application definition
 
 INSTALLED_APPS = [
+    'community',
     'run',
+    'tourinfo',
     'rest_framework',
     'django.contrib.admin',
     'django.contrib.auth',
