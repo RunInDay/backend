@@ -16,7 +16,9 @@ Including another URLconf
 """
 from django.contrib import admin
 from django.urls import path
+from .views import upload_to_supabase
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('upload/', upload_to_supabase, name="upload_to_supabase")
 ]
