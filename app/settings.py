@@ -2,7 +2,7 @@ from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
 
-load_dotenv(path=".env")
+load_dotenv()
 
 class Settings(BaseModel):
     SUPABASE_URL: str = os.getenv("SUPABASE_URL", "")
