@@ -16,23 +16,20 @@ from app.settings import settings
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 # ---------- Supabase Client ----------
-def get_supabase_client() -> Client:
-    """
-    환경에 따라 우선순위를 정해 키를 선택:
-    - prod/stage: SERVICE_ROLE 우선 (서버 사이드)
-    - local/dev: SERVICE_ROLE이 없으면 ANON 사용
-    """
+def get_clients() -> tuple[Client, Client | None]:
     url = settings.SUPABASE_URL
     if not url:
         raise RuntimeError("SUPABASE_URL is missing")
 
-    key = settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_ANON_KEY
-    if not key:
-        raise RuntimeError("No Supabase key found (SERVICE_ROLE or ANON)")
+    public_key = settings.SUPABASE_ANON_KEY or settings.SUPABASE_SERVICE_ROLE_KEY
+    if not public_key:
+        raise RuntimeError("No Supabase key found (ANON/SERVICE_ROLE)")
+    supabase_public = create_client(url, public_key)
 
-    return create_client(url, key)
+    supabase_admin = create_client(url, settings.SUPABASE_SERVICE_ROLE_KEY) if settings.SUPABASE_SERVICE_ROLE_KEY else None
+    return supabase_public, supabase_admin
 
-supabase = get_supabase_client()
+supabase, supabase_admin = get_clients()
 
 
 # ---------- Schemas ----------
@@ -62,6 +59,20 @@ class UpdateMeIn(BaseModel):
     # user_metadata
     username: Optional[str] = None
     image: Optional[str] = None
+
+class ConfirmDeleteIn(BaseModel):
+    password: str
+
+class ChangePasswordIn(BaseModel):
+    old_password: str
+    new_password: str
+
+class ResetRequestIn(BaseModel):
+    email: EmailStr
+    redirect_to: Optional[str] = None
+
+class ResetConfirmIn(BaseModel):
+    new_password: str
 
 
 # ---------- Helpers ----------
@@ -229,7 +240,6 @@ def update_me(
 ):
     """
     - username / image → Supabase user_metadata (admin.update_user_by_id)
-    - email / password → Supabase Auth (admin.update_user_by_id)  ※ SERVICE_ROLE 필요
     """
     # 1) auth 영역 변경(메타데이터)
     attributes = {}
@@ -265,12 +275,20 @@ def update_me(
     )
 
 @router.delete("/me", status_code=HTTP_200_OK)
-def delete_me(current: UserOut = Depends(get_current_user)):
+def delete_me(
+    body: ConfirmDeleteIn,
+    current: UserOut = Depends(get_current_user)):
     """
     - profiles 행 삭제
     - Supabase Auth 사용자 삭제 (SERVICE_ROLE 필요)
     """
-    # 1) profiles 정리 (멱등)
+    # 0) 비밀번호 확인 (현재 이메일 + 입력한 비밀번호로 로그인 시도)
+    try:
+        supabase.auth.sign_in_with_password({"email": current.email, "password": body.password})
+    except Exception:
+        raise HTTPException(HTTP_401_UNAUTHORIZED, "Password check failed")
+    
+    # 1) profiles 정리
     try:
         supabase.table("profiles").delete().eq("user_id", current.id).execute()
     except Exception:
@@ -283,8 +301,68 @@ def delete_me(current: UserOut = Depends(get_current_user)):
             "Server cannot delete auth user without SERVICE_ROLE key"
         )
     try:
-        supabase.auth.admin.delete_user(current.id)
+        supabase_admin.auth.admin.delete_user(current.id)
     except Exception as e:
         raise HTTPException(HTTP_400_BAD_REQUEST, f"Auth delete failed: {e}")
+
+    return {"ok": True}
+
+@router.post("/password/change", status_code=HTTP_200_OK)
+def change_password(
+    body: ChangePasswordIn,
+    current: UserOut = Depends(get_current_user),
+):
+    """
+    로그인 상태에서 비밀번호 변경:
+    1) old_password로 재인증
+    2) SERVICE_ROLE로 새 비밀번호 설정
+    """
+    # 1) 재인증
+    try:
+        supabase.auth.sign_in_with_password({"email": current.email, "password": body.old_password})
+    except Exception:
+        raise HTTPException(HTTP_401_UNAUTHORIZED, "Old password is incorrect")
+
+    # 2) 변경
+    if not settings.SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(HTTP_400_BAD_REQUEST, "SERVICE_ROLE key required to change password on server")
+    try:
+        supabase_admin.auth.admin.update_user_by_id(current.id, attributes={"password": body.new_password})
+    except Exception as e:
+        raise HTTPException(HTTP_400_BAD_REQUEST, f"Password change failed: {e}")
+
+    return {"ok": True}
+
+@router.post("/password/reset/request", status_code=HTTP_200_OK)
+def request_password_reset(body: ResetRequestIn):
+    """
+    비밀번호 재설정 이메일 발송 (사용자가 비밀번호를 잊어버렸을 때)
+    - redirect_to를 지정하면 링크 클릭 후 돌아올 페이지로 이동
+    """
+    try:
+        options = {"redirect_to": body.redirect_to} if body.redirect_to else None
+        supabase_admin.auth.reset_password_for_email(str(body.email), options=options)
+    except Exception as e:
+        raise HTTPException(HTTP_400_BAD_REQUEST, f"Reset request failed: {e}")
+    return {"ok": True}
+
+@router.post("/password/reset/confirm", status_code=HTTP_200_OK)
+def confirm_password_reset(
+    body: ResetConfirmIn,
+    current: UserOut = Depends(get_current_user),
+):
+    """
+    재설정 링크 클릭 후, 클라이언트가 받은 세션 토큰(Authorization)로 최종 비밀번호 설정.
+    - SERVICE_ROLE이 있으면 admin.update_user_by_id 사용
+    - 없으면 현재 세션 컨텍스트로 update_user 시도
+    """
+    try:
+        if settings.SUPABASE_SERVICE_ROLE_KEY:
+            supabase.auth.admin.update_user_by_id(current.id, attributes={"password": body.new_password})
+        else:
+            # 세션 기반 업데이트 (현재 Authorization 토큰이 reset 링크로 발급된 세션이어야 함)
+            supabase.auth.update_user({"password": body.new_password})
+    except Exception as e:
+        raise HTTPException(HTTP_400_BAD_REQUEST, f"Reset confirm failed: {e}")
 
     return {"ok": True}
